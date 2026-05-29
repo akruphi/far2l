@@ -5103,6 +5103,8 @@ void KeyMacro::SaveMacros(BOOL AllSaved)
 			else
 				cfg_writer.RemoveKey(KeywordName.GetMB());
 		}
+
+		MacroLIB[I].Flags &= ~MFLAGS_NEEDSAVEMACRO;
 	}
 }
 
@@ -6771,4 +6773,227 @@ BOOL KeyMacro::GetMacroParseError(FARString *Err1, FARString *Err2, FARString *E
 bool KeyMacro::IsOpCode(DWORD p)
 {
 	return (!(p & KEY_MACRO_BASE) || p == MCODE_OP_ENDKEYS) ? false : true;
+}
+
+// Mark macro by index (imacro) as Deleted
+// Note: if macro has !BufferSize or !Src it will remove in SaveMacros()
+//  and we shouldn't remove it from memory because we need to delete it when we save
+bool KeyMacro::MacroDelete(int imacro, bool bfull)
+{
+	if (imacro < 0 || imacro >= MacroLIBCount) // check macro index
+		return false; // invalid macro index
+	if (IsExecuting() || IsRecording())
+		return false;	// prevent modification during macro execution or recording
+
+	if (MacroLIB[imacro].BufferSize > 1 && MacroLIB[imacro].Buffer)
+		free(MacroLIB[imacro].Buffer);
+
+	if (MacroLIB[imacro].Src)
+		free(MacroLIB[imacro].Src);
+
+	if (MacroLIB[imacro].Description)
+		free(MacroLIB[imacro].Description);
+
+	MacroLIB[imacro].Buffer = nullptr;
+	MacroLIB[imacro].BufferSize = 0;
+	MacroLIB[imacro].Src = nullptr;
+	MacroLIB[imacro].Description = nullptr;
+	MacroLIB[imacro].Flags|= MFLAGS_NEEDSAVEMACRO;
+
+	if (bfull) { // no need sort+save if after clear macro data we continue work with macro record
+		KeyMacro::Sort();
+		if (Opt.AutoSaveSetup)
+			SaveMacros(FALSE);	// записать только изменения!
+	}
+
+	return true; // success: macro mark as deleted
+}
+
+// Replace macro by index (if imacro >=0) or Add new macro (if imacro < 0)
+// Return value:
+//   0: successfully
+//  -1: prevent modification during macro execution or recording
+//  -2: invalid macro index (imacro)
+//  -3: invalid macroarea index (iarea)
+//  -4: for Add iarea are mandatory, but iarea < 0
+//  -5: Некорректная комбинация клавиш
+//  -6: Пустая последовательность макрокоманды
+//  -7: Некорректная последовательность макрокоманды
+//  -8: Изменения полность эквивалентны исходному => не меняем
+//  -9: В выбранной области уже присутствует другой не удаленный макрос с такой же комбинацией клавиш
+// -10: Error memory reallocation
+// -11: Delete error
+int KeyMacro::MacroReplaceAdd(int imacro, int iarea,
+		DWORD Flags, const wchar_t *pstrKey, const wchar_t *pstrSequence, const wchar_t *pstrDescription)
+{
+	if (IsExecuting() || IsRecording())
+		return -1;	// prevent modification during macro execution or recording
+	if (iarea >= MACRO_LAST) // if iarea also check macro area
+		return -3; // invalid macroarea index
+	if (imacro >= 0) {
+		if (imacro >= MacroLIBCount) // for Replace check macro index
+			return -2; // invalid macro index
+		if (iarea < 0)
+			iarea = (int)(MacroLIB[imacro].Flags & MFLAGS_MODEMASK); // use area of current macro
+	}
+	else {
+		if (iarea < 0)
+			return -4; // for Add iarea are mandatory
+	}
+
+	MacroRecord mr{};
+
+	FARString strtmp = pstrKey;
+	RemoveExternalSpaces(strtmp);
+	mr.Key = KeyNameToKey(strtmp); // Назначенная клавиша
+	if (mr.Key == KEY_INVALID)
+		return -5; // Некорректная комбинация клавиш
+
+	strtmp = pstrSequence;
+	RemoveExternalSpaces(strtmp);
+	if (strtmp.IsEmpty())
+		return -6; // Пустая последовательность макрокоманды
+
+	FARString strDescription = pstrDescription;
+	RemoveExternalSpaces(strDescription);
+	while (strDescription.Contains(L"  "))
+		ReplaceStrings(strDescription, L"  ", L" ");
+
+
+	mr.BufferSize = 0;			// Размер буфера компилированной последовательности
+	mr.Buffer = nullptr;		// компилированная последовательность (OpCode) макроса
+	mr.Flags = (Flags & ~MFLAGS_MODEMASK) | iarea;
+	if (!ParseMacroString(&mr, strtmp.CPtr()))
+		return -7; // Некорректная последовательность макрокоманды
+
+	if (imacro >= 0
+			&& MacroLIB[imacro].Key == mr.Key
+			&& (int)(MacroLIB[imacro].Flags & MFLAGS_MODEMASK) == iarea
+			&& (MacroLIB[imacro].Flags & ~MFLAGS_MODEMASK & ~MFLAGS_NEEDSAVEMACRO)
+				== (Flags & ~MFLAGS_MODEMASK & ~MFLAGS_NEEDSAVEMACRO)
+			&& MacroLIB[imacro].BufferSize == mr.BufferSize
+			&& (mr.BufferSize > 1
+				? !memcmp(MacroLIB[imacro].Buffer, mr.Buffer, mr.BufferSize * sizeof(*mr.Buffer))
+				: MacroLIB[imacro].Buffer == mr.Buffer)
+			&& !StrCmp(MacroLIB[imacro].Description, strDescription) ) {
+		if (mr.BufferSize > 1)
+			free(mr.Buffer);
+		return -8; // Изменения полностью эквивалентны исходному => не трогаем
+	}
+
+	// check dublicates by Key in macro area
+	int ipos = -1;
+	{	// used part of code from GetIndex()
+		MacroRecord *mptr = &MacroLIB[IndexMode[iarea][0]];
+		for (int i = 0; i < IndexMode[iarea][1]; ++i, ++mptr) {
+			if (!((mptr->Key ^ mr.Key) & ~0xFFFFu)
+					&& (Upper(static_cast<WCHAR>(mptr->Key)) == Upper(static_cast<WCHAR>(mr.Key)))) {
+				ipos = IndexMode[iarea][0] + i;
+				break;
+			}
+		}
+	}
+	if (ipos != -1 && ipos != imacro) { // В выбранной области уже присутствует другой макрос с такой же комбинацией клавиш
+		if (!MacroLIB[ipos].BufferSize || !MacroLIB[ipos].Src) { // другой макрос помечен как удаленный => работаем поверх него
+			if (imacro >= 0) { // редактирование, т.е. есть текущий
+				if (!MacroDelete(imacro, false)) {	// => текущий удаляем
+					if (mr.BufferSize > 1)
+						free(mr.Buffer);
+					return -11; // Delete error
+				}
+			}
+			imacro = ipos;						//  и работаем далее поверх того
+		}
+		else {
+			if (mr.BufferSize > 1)
+				free(mr.Buffer);
+			return -9; // В выбранной области уже присутствует другой активный макрос с такой же комбинацией клавиш
+		}
+	}
+
+	// === Macros add/replace ===
+	ipos = imacro;
+	// for Add or Replace with New Key and/or New Area need memory allocation
+	if (imacro < 0
+			|| mr.Key != MacroLIB[imacro].Key
+			|| iarea != (int)(MacroLIB[imacro].Flags & MFLAGS_MODEMASK)) {
+		MacroRecord *NewMacroLIB =
+				(MacroRecord *)realloc(MacroLIB, sizeof(*MacroLIB) * (MacroLIBCount + 1));
+		if (!NewMacroLIB) {
+			if (mr.BufferSize > 1)
+				free(mr.Buffer);
+			return -10; // Error memory reallocation
+		}
+		ipos = MacroLIBCount; // new macro add to end
+		MacroLIB = NewMacroLIB;
+		MacroLIBCount++;
+	}
+	if (imacro >= 0) { // before Replace we need free macro data without sort
+		if (!MacroDelete(imacro, false)) {
+			if (mr.BufferSize > 1)
+				free(mr.Buffer);
+			return -11; // Delete error
+		}
+	}
+
+	// Set data to macro
+	MacroLIB[ipos].Key = mr.Key;
+
+	if (mr.BufferSize > 1)
+		MacroLIB[ipos].Buffer = mr.Buffer;
+	else if (mr.Buffer && mr.BufferSize > 0)
+		MacroLIB[ipos].Buffer = reinterpret_cast<DWORD *>((DWORD_PTR)(*mr.Buffer));
+	else if (!mr.BufferSize)
+		MacroLIB[ipos].Buffer = nullptr;
+	MacroLIB[ipos].BufferSize = mr.BufferSize;
+
+	while (strtmp.Contains(L"  "))
+		ReplaceStrings(strtmp, L"  ", L" ");
+	MacroLIB[ipos].Src = wcsdup(strtmp.GetBuffer()); // pstrSequence
+
+	strtmp = pstrDescription;
+	RemoveExternalSpaces(strtmp);
+	while (strtmp.Contains(L"  "))
+		ReplaceStrings(strtmp, L"  ", L" ");
+	MacroLIB[ipos].Description = strtmp.IsEmpty() ? nullptr: wcsdup(strtmp.GetBuffer());
+
+	MacroLIB[ipos].Flags = (Flags & ~MFLAGS_MODEMASK) | iarea | MFLAGS_NEEDSAVEMACRO;
+
+	KeyMacro::Sort();
+	if (Opt.AutoSaveSetup)
+		SaveMacros(FALSE);	// записать только изменения!
+
+	return 0; // success: macro Added / Replaced
+}
+
+// used in MacroBrowser
+void MacroLib_KeywordsFunctions2Items(std::vector<FarListItem> &Items)
+{
+	size_t i;
+	Items.emplace_back();
+	Items.back().Flags = LIF_SEPARATOR;
+	Items.back().Text = L"Codes";
+	for(i = 0; i < ARRAYSIZE(KeyMacroCodes); i++) {
+		Items.emplace_back();
+		Items.back().Flags = LIF_SELECTED;
+		Items.back().Text = KeyMacroCodes[i].Name;
+	}
+
+	Items.emplace_back();
+	Items.back().Flags = LIF_SEPARATOR;
+	Items.back().Text = L"Keywords";
+	for(i = 0; i < ARRAYSIZE(MKeywords); i++) {
+		Items.emplace_back();
+		Items.back().Flags = LIF_SELECTED;
+		Items.back().Text = MKeywords[i].Name;
+	}
+
+	Items.emplace_back();
+	Items.back().Flags = LIF_SEPARATOR;
+	Items.back().Text = L"Functions";
+	for(i = 0; i < ARRAYSIZE(intMacroFunction) - 1; i++) {
+		Items.emplace_back();
+		Items.back().Flags = LIF_SELECTED;
+		Items.back().Text = intMacroFunction[i].Syntax;
+	}
 }
